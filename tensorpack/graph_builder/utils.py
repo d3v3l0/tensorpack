@@ -239,7 +239,8 @@ def allreduce_grads_hierarchical(all_grads, devices, average=False):
 def aggregate_grads(all_grads,
                     colocation=False,
                     devices=None,
-                    average=True):
+                    average=True,
+                    aggregation_frequency=1):
     """
     Average the gradients.
 
@@ -250,6 +251,7 @@ def aggregate_grads(all_grads,
         devices (list[str]): assign the averaging to these device in
             round-robin. Cannot be used together with ``colocation``.
         average (bool): do average or sum
+        aggregation_frequency (int): how often parameters are aggregated
 
     Returns:
         (N x 2): A list of N (grad, var) tuples, where grad is averaged or summed over K.
@@ -264,9 +266,9 @@ def aggregate_grads(all_grads,
 
     def aggregate(grads):
         if average:
-            return tf.multiply(tf.add_n(grads), 1.0 / nr_tower)
+            return tf.multiply(tf.add_n(grads), 1.0 / (nr_tower * aggregation_frequency))
         else:
-            return tf.add_n(grads)
+            return tf.multiply(tf.add_n(grads), 1.0 / aggregation_frequency)
 
     ret = []
     for idx, grad_and_vars in enumerate(zip(*all_grads)):
@@ -275,7 +277,7 @@ def aggregate_grads(all_grads,
         grads = [g for (g, _) in grad_and_vars]
 
         if colocation:
-            with tf.device(v.device):       # colocate summed grad with var
+            with tf.device(v.device):  # colocate summed grad with var
                 grad = aggregate(grads)
         elif devices is None:
             grad = aggregate(grads)
@@ -284,6 +286,7 @@ def aggregate_grads(all_grads,
             with tf.device(dev):
                 grad = aggregate(grads)
         ret.append((grad, v))
+
     return ret
 
 

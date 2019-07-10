@@ -178,7 +178,7 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
             (host2)$ CUDA_VISIBLE_DEVICES= ./train.py --job ps --task 1
     """
 
-    def __init__(self, towers, server):
+    def __init__(self, towers, server, aggregation_frequency):
         """
         Args:
             towers (list[int]): list of GPU ids.
@@ -200,6 +200,19 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
 
         # Device for queues for managing synchronization between servers
         self.sync_queue_devices = ['/job:ps/task:%s/cpu:0' % i for i in range(self.num_ps)]
+
+        # How often are parameters synchronized
+        self.aggregation_frequency = aggregation_frequency
+        assert self.aggregation_frequency > 0
+
+        # This is going to be K x N x 2 data structure holding the per-GPU aggregated updates
+        # and vars for parameter updates. K is the number of GPUs on the machine. N is the number
+        # of parameters, and there are 2 entries per parameter because each entry contains
+        # the gradient update and the original parameter.
+        self.gpu_shadow_vars = []
+
+        # Used by comm_op to know when it can begin reading aggregated values.
+        self.counter = tf.ConditionalAccumulator(tf.float32)
 
     @staticmethod
     def _apply_shadow_vars(avg_grads):
@@ -277,27 +290,101 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
         get_opt_fn = memoized(get_opt_fn)
         # Build the optimizer first, before entering any tower.
         # This makes sure that learning_rate is a global variable (what we expect)
-        get_opt_fn()    # TODO get_opt_fn called before main graph was built
+        get_opt_fn()  # TODO get_opt_fn called before main graph was built
 
         # Ngpu * Nvar * 2
-        grad_list = DataParallelBuilder.build_on_towers(
+        self.grad_list = DataParallelBuilder.build_on_towers(
             self.towers, get_grad_fn,
             devices=self.raw_devices,
             use_vs=[True] * len(self.towers))  # open vs at each tower
-        DataParallelBuilder._check_grad_list(grad_list)
+        DataParallelBuilder._check_grad_list(self.grad_list)
 
-        avg_grads = aggregate_grads(
-            grad_list, colocation=False, devices=self.raw_devices)
-        with tf.device(self.param_server_device):
-            ps_var_grads = DistributedReplicatedBuilder._apply_shadow_vars(avg_grads)
-            var_update_ops = self._apply_gradients_and_copy(
-                get_opt_fn(), grad_list, ps_var_grads)
-            self._shadow_vars = [v for (__, v) in ps_var_grads]
-            self._shadow_model_vars = DistributedReplicatedBuilder._shadow_model_variables(self._shadow_vars)
+        aggregation_ops_list = []
+        if self.aggregation_frequency > 1:
+            assert not self.gpu_shadow_vars
+            # Create the variables which will be used to store aggregated updates.
+            for k, (grad_list, device) in enumerate(zip(self.grad_list, self.raw_devices)):
+                self.gpu_shadow_vars.append([])
+                with tf.device(device), tf.variable_scope("aggregation_variables"):
+                    for idx, (grad, var) in enumerate(grad_list):
+                        grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
+                            tower_id=k, variable_id=idx)
+                        grad_aggregation_variable = tf.get_variable(
+                            grad_aggregation_variable_name, shape=grad.get_shape().as_list(),
+                            trainable=False, initializer=tf.zeros_initializer(),
+                            collections=[tf.GraphKeys.LOCAL_VARIABLES, "aggregating_collection"])
+                        self.gpu_shadow_vars[-1].append((grad_aggregation_variable, None))
+            assert len(self.gpu_shadow_vars) == len(self.grad_list)
 
-        # TODO add options to synchronize less
+            # Apply new gradients to aggregation variables.
+            for k, (grad_list, device, gpu_shadow_vars) in enumerate(
+                    zip(self.grad_list, self.raw_devices, self.gpu_shadow_vars)):
+                with tf.device(device), tf.variable_scope("aggregation_variables", reuse=True):
+                    for idx, (grad, var) in enumerate(grad_list):
+                        grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
+                            tower_id=k, variable_id=idx)
+                        grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                        aggregation_ops_list.append(grad_aggregator.assign_add(grad))
+                        gpu_shadow_vars[idx] = (gpu_shadow_vars[idx][0], var)
+        aggregation_ops = tf.group(*aggregation_ops_list)
+
+        # TODO: Use tf.queue instead of ConditionalAccumulator.
+        with tf.control_dependencies([aggregation_ops]):
+            # Using a large local step count so that it's always bigger than global step, which is incremented
+            # every time we call self.counter.take_grad().
+            train_op = self.counter.apply_grad(tf.constant([1], dtype=tf.float32), local_step=990000000)
+
+        # Communication op begins here.
+        ready_to_communicate = self.counter.take_grad(self.aggregation_frequency)
+
+        if self.aggregation_frequency > 1:
+            # Read in latest variables values.
+            aggregated_grads = []
+            aggregation_read_ops_list = []
+            with tf.control_dependencies([ready_to_communicate]):
+                for k, gpu_shadow_vars in enumerate(self.gpu_shadow_vars):
+                    tower_aggregated_grads = []
+                    with tf.device(self.raw_devices[k]), tf.variable_scope("aggregation_variables", reuse=True):
+                        for idx, (grad, var) in enumerate(gpu_shadow_vars):
+                            grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
+                                tower_id=k, variable_id=idx)
+                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                            tower_aggregated_grads.append((grad_aggregator.read_value(), var))
+                            aggregation_read_ops_list.append(tower_aggregated_grads[idx][0].op)
+                    aggregated_grads.append(tower_aggregated_grads)
+            aggregation_read_ops = tf.group(*aggregation_read_ops_list)
+
+            # Clear gradients.
+            clear_ops_list = []
+            with tf.control_dependencies([aggregation_read_ops]):
+                for k, gpu_shadow_vars in enumerate(self.gpu_shadow_vars):
+                    for idx, (grad, var) in enumerate(gpu_shadow_vars):
+                        with tf.device(self.raw_devices[k]), tf.variable_scope("aggregation_variables", reuse=True):
+                            grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
+                                tower_id=k, variable_id=idx)
+                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                            clear_op = grad_aggregator.assign(grad_aggregator.initial_value)
+                            clear_ops_list.append(clear_op)
+            clear_ops = tf.group(*clear_ops_list)
+        else:
+            aggregated_grads = self.grad_list
+            clear_ops = ready_to_communicate
+
+        with tf.control_dependencies([clear_ops]):
+            avg_grads = aggregate_grads(
+                aggregated_grads, colocation=False,
+                devices=self.raw_devices, average=False,
+                aggregation_frequency=self.aggregation_frequency)
+
+            with tf.device(self.param_server_device):
+                ps_var_grads = DistributedReplicatedBuilder._apply_shadow_vars(avg_grads)
+                var_update_ops = self._apply_gradients_and_copy(
+                    get_opt_fn(), self.grad_list, ps_var_grads)
+                self._shadow_vars = [v for _, v in ps_var_grads]
+                self._shadow_model_vars = DistributedReplicatedBuilder._shadow_model_variables(self._shadow_vars)
+
         main_fetch = tf.group(*var_update_ops, name='main_fetches')
-        train_op = self._add_sync_queues_and_barrier(
+        communicate_op = self._add_sync_queues_and_barrier(
             'post_copy_barrier', [main_fetch])
 
         # initial local_vars syncing
@@ -308,7 +395,21 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
                 model_sync_op = self._get_sync_model_vars_op()
         else:
             model_sync_op = None
-        return train_op, initial_sync_op, model_sync_op
+        return train_op, communicate_op, initial_sync_op, model_sync_op
+
+    def _get_grad_aggregator_variable_name(self, tower_id, variable_id):
+        """
+        Get the name of the tf.variable used for aggregating updates for this
+        variable.
+
+        Args:
+            tower_id: index of the GPU within the machine
+            variable_id: index of the variable
+
+        Returns:
+            Variable name.
+        """
+        return f"task{self.task_index}tower{tower_id}idx{variable_id}"
 
     def _apply_gradients_and_copy(self, opt, raw_grad_list, ps_var_grads):
         """

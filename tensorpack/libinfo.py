@@ -95,6 +95,7 @@ else:
 
         tf.test.is_gpu_available = is_gpu_available
 
+__is_determined_ai__ = True
 
 # These lines will be programatically read/write by setup.py
 # Don't touch them.

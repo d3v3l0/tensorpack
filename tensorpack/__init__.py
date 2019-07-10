@@ -2,7 +2,7 @@
 # File: __init__.py
 
 
-from tensorpack.libinfo import __version__, __git_version__, _HAS_TF
+from tensorpack.libinfo import __version__, __git_version__, _HAS_TF, __is_determined_ai__
 
 from tensorpack.utils import *
 from tensorpack.dataflow import *
