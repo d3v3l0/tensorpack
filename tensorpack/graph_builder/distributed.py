@@ -350,27 +350,14 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
                                 tower_id=k, variable_id=idx)
                             grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
                             tower_aggregated_grads.append((grad_aggregator.read_value(), var))
-                            aggregation_read_ops_list.append(tower_aggregated_grads[idx][0].op)
+                            aggregation_read_ops_list.append(tower_aggregated_grads[idx][0])
                     aggregated_grads.append(tower_aggregated_grads)
             aggregation_read_ops = tf.group(*aggregation_read_ops_list)
-
-            # Clear gradients.
-            clear_ops_list = []
-            with tf.control_dependencies([aggregation_read_ops]):
-                for k, gpu_shadow_vars in enumerate(self.gpu_shadow_vars):
-                    for idx, (grad, var) in enumerate(gpu_shadow_vars):
-                        with tf.device(self.raw_devices[k]), tf.variable_scope("aggregation_variables", reuse=True):
-                            grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
-                                tower_id=k, variable_id=idx)
-                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
-                            clear_op = grad_aggregator.assign(grad_aggregator.initial_value)
-                            clear_ops_list.append(clear_op)
-            clear_ops = tf.group(*clear_ops_list)
         else:
             aggregated_grads = self.grad_list
-            clear_ops = ready_to_communicate
+            aggregation_read_ops = ready_to_communicate
 
-        with tf.control_dependencies([clear_ops]):
+        with tf.control_dependencies([aggregation_read_ops]):
             avg_grads = aggregate_grads(
                 aggregated_grads, colocation=False,
                 devices=self.raw_devices, average=False,
@@ -384,8 +371,25 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
                 self._shadow_model_vars = DistributedReplicatedBuilder._shadow_model_variables(self._shadow_vars)
 
         main_fetch = tf.group(*var_update_ops, name='main_fetches')
+
+        # Clear gradients.
+        clear_ops_list = []
+        if self.aggregation_frequency > 1:
+            with tf.control_dependencies([main_fetch]):
+                for k, gpu_shadow_vars in enumerate(self.gpu_shadow_vars):
+                    for idx, (grad, var) in enumerate(gpu_shadow_vars):
+                        with tf.device(self.raw_devices[k]), tf.variable_scope("aggregation_variables", reuse=True):
+                            grad_aggregation_variable_name = self._get_grad_aggregator_variable_name(
+                                tower_id=k, variable_id=idx)
+                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                            clear_op = grad_aggregator.assign(grad_aggregator.initial_value)
+                            clear_ops_list.append(clear_op)
+            clear_ops = tf.group(*clear_ops_list)
+        else:
+            clear_ops = main_fetch
+
         communicate_op = self._add_sync_queues_and_barrier(
-            'post_copy_barrier', [main_fetch])
+            'post_copy_barrier', [clear_ops])
 
         # initial local_vars syncing
         with tf.name_scope('initial_sync_variables'):
