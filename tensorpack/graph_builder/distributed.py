@@ -361,6 +361,7 @@ class DistributedReplicatedBuilder(DataParallelBuilder, DistributedBuilderBase):
             avg_grads = aggregate_grads(
                 aggregated_grads, colocation=False,
                 devices=self.raw_devices, average=False,
+                use_nccl=True,
                 aggregation_frequency=self.aggregation_frequency)
 
             with tf.device(self.param_server_device):

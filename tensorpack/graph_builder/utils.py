@@ -5,6 +5,7 @@
 import operator
 from contextlib import contextmanager
 import tensorflow as tf
+from tensorflow.python.ops import nccl_ops as nccl
 
 from ..compat import tfv1
 from ..tfutils.common import get_tf_version_tuple
@@ -240,6 +241,7 @@ def aggregate_grads(all_grads,
                     colocation=False,
                     devices=None,
                     average=True,
+                    use_nccl=False,
                     aggregation_frequency=1):
     """
     Average the gradients.
@@ -250,6 +252,7 @@ def aggregate_grads(all_grads,
         colocation (bool): colocate gradient averaging on the device of the variable.
         devices (list[str]): assign the averaging to these device in
             round-robin. Cannot be used together with ``colocation``.
+        use_nccl (bool): use nccl to perform reduce sum.
         average (bool): do average or sum
         aggregation_frequency (int): how often parameters are aggregated
 
@@ -265,10 +268,14 @@ def aggregate_grads(all_grads,
         return all_grads[0]
 
     def aggregate(grads):
-        if average:
-            return tf.multiply(tf.add_n(grads), 1.0 / (nr_tower * aggregation_frequency))
+        if use_nccl:
+            grad_sum = tf.identity(nccl.reduce_sum(grads))
         else:
-            return tf.multiply(tf.add_n(grads), 1.0 / aggregation_frequency)
+            grad_sum = tf.add_n(grads)
+        if average:
+            return tf.multiply(grad_sum, 1.0 / (nr_tower * aggregation_frequency))
+        else:
+            return tf.multiply(grad_sum, 1.0 / aggregation_frequency)
 
     ret = []
     for idx, grad_and_vars in enumerate(zip(*all_grads)):
