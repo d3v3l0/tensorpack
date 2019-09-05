@@ -419,6 +419,7 @@ class HorovodTrainer(SingleCostTrainer):
 
             opt = get_opt_fn()
             self.train_op = opt.apply_gradients(grads, name='train_op')
+            self.comm_op = tf.no_op()
 
         def broadcast(self):
             logger.info("Running broadcast ...")
