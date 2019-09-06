@@ -56,6 +56,13 @@ def internal_update_bn_ema(xn, batch_mean, batch_var,
         return tf.identity(xn, name='output')
 
 
+try:
+    from tensorflow.python.autograph.impl.api import do_not_convert as disable_autograph
+except ImportError:
+    def disable_autograph():
+        return lambda x: x
+
+
 @layer_register()
 @convert_to_tflayer_args(
     args_names=[],
@@ -66,6 +73,9 @@ def internal_update_bn_ema(xn, batch_mean, batch_var,
         'decay': 'momentum',
         'use_local_stat': 'training'
     })
+@disable_autograph()
+# Autograph prints out too many warnings when BatchNorm is used in a keras layer.
+# This os observed in TF 1.14.0.
 def BatchNorm(inputs, axis=None, training=None, momentum=0.9, epsilon=1e-5,
               center=True, scale=True,
               beta_initializer=tf.zeros_initializer(),
