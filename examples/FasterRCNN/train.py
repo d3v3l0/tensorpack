@@ -119,7 +119,7 @@ if __name__ == '__main__':
         starting_epoch=cfg.TRAIN.STARTING_EPOCH
     )
     if is_horovod:
-        trainer = HorovodTrainer(average=False)
+        trainer = HorovodTrainer(average=False, aggregation_frequency=2)
     else:
         # nccl mode appears faster than cpu mode
         trainer = SyncMultiGPUTrainerReplicated(cfg.TRAIN.NUM_GPUS, average=False, mode='nccl')

@@ -370,7 +370,7 @@ class HorovodTrainer(SingleCostTrainer):
            for a full example which has handled these common issues.
            This example can train ImageNet in roughly an hour following the paper's setup.
     """
-    def __init__(self, average=True, compression=None):
+    def __init__(self, average=True, compression=None, aggregation_frequency=1):
         """
         Args:
             average (bool): whether to average or sum the gradients across processes.
@@ -392,6 +392,19 @@ class HorovodTrainer(SingleCostTrainer):
         self._average = average
         self._compression = compression
         self._has_compression = hvd_version >= (0, 15, 0)
+
+        # How often are parameters synchronized
+        self._aggregation_frequency = aggregation_frequency
+        assert self._aggregation_frequency > 0
+
+        # This is going to be N x 2 data structure holding the per-GPU aggregated updates and vars
+        # for parameter updates. N is the number of parameters, and there are 2 entries per
+        # parameter because each entry contains the gradient update and the original parameter.
+        self.gpu_shadow_vars = []
+
+        # Used by comm_op to know when it can begin reading aggregated values.
+        self.counter = tf.ConditionalAccumulator(tf.float32)
+
         logger.info("[HorovodTrainer] local rank={}".format(self._local_rank))
         super(HorovodTrainer, self).__init__()
 
@@ -403,10 +416,11 @@ class HorovodTrainer(SingleCostTrainer):
         with tf.name_scope("AllReduce"):
             for grad, var in grads:
                 if grad is not None:
+                    scaled_grad = tf.math.divide(grad, self._aggregation_frequency)
                     if self._compression is not None and self._has_compression:
-                        avg_grad = self.hvd.allreduce(grad, average=self._average, compression=self._compression)
+                        avg_grad = self.hvd.allreduce(scaled_grad, average=self._average, compression=self._compression)
                     else:
-                        avg_grad = self.hvd.allreduce(grad, average=self._average)
+                        avg_grad = self.hvd.allreduce(scaled_grad, average=self._average)
                     averaged_gradients.append((avg_grad, var))
                 else:
                     averaged_gradients.append((None, var))
@@ -414,12 +428,79 @@ class HorovodTrainer(SingleCostTrainer):
 
     def _setup_graph(self, input, get_cost_fn, get_opt_fn):
         with TrainTowerContext(''):
-            grads = self._make_get_grad_fn(input, get_cost_fn, get_opt_fn)()
-            grads = self.allreduce(grads)
+            self.grads = self._make_get_grad_fn(input, get_cost_fn, get_opt_fn)()
+            aggregation_ops_list = []
+            if self._aggregation_frequency > 1:
+                # Create the variables which will be used to store aggregated updates.
+                with tf.variable_scope("aggregation_variables"):
+                    for idx, (grad, var) in enumerate(self.grads):
+                        # It's okay to not name the variables based off of the task+tower+idx
+                        # because each of the graphs will be running in separate processes thanks
+                        # to Horovod.
+                        grad_aggregation_variable_name = str(idx)
+                        grad_aggregation_variable = tf.get_variable(
+                            grad_aggregation_variable_name, shape=grad.get_shape().as_list(),
+                            trainable=False, initializer=tf.zeros_initializer(),
+                            collections=[tf.GraphKeys.LOCAL_VARIABLES, "aggregating_collection"])
+                        self.gpu_shadow_vars.append((grad_aggregation_variable, None))
+                assert len(self.gpu_shadow_vars) == len(self.grads)
 
-            opt = get_opt_fn()
-            self.train_op = opt.apply_gradients(grads, name='train_op')
-            self.comm_op = tf.no_op()
+                # Apply new gradients to aggregation variables.
+                with tf.variable_scope("aggregation_variables", reuse=True):
+                    for idx, (grad, var) in enumerate(self.grads):
+                        grad_aggregation_variable_name = str(idx)
+                        grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                        update_op = grad_aggregator.assign_add(grad)
+                        aggregation_ops_list.append(update_op)
+                        self.gpu_shadow_vars[idx] = (self.gpu_shadow_vars[idx][0], var)
+            aggregation_ops = tf.group(*aggregation_ops_list)
+
+            # TODO: Use tf.queue instead of ConditionalAccumulator.
+            with tf.control_dependencies([aggregation_ops]):
+                # Using a large local step count so that it's always bigger than global step, which is incremented
+                # every time we call self.counter.take_grad().
+                self.train_op = self.counter.apply_grad(tf.constant([1], dtype=tf.float32), local_step=990000000)
+
+            # Communication op begins here.
+            ready_to_communicate = self.counter.take_grad(self._aggregation_frequency)
+
+            if self._aggregation_frequency > 1:
+                # Read in latest variables values.
+                aggregated_grads = []
+                aggregation_read_ops_list = []
+                with tf.control_dependencies([ready_to_communicate]):
+                    with tf.variable_scope("aggregation_variables", reuse=True):
+                        for idx, (grad, var) in enumerate(self.gpu_shadow_vars):
+                            grad_aggregation_variable_name = str(idx)
+                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                            aggregated_grads.append((grad_aggregator.read_value(), var))
+                            aggregation_read_ops_list.append(aggregated_grads[idx][0])
+                aggregation_read_ops = tf.group(*aggregation_read_ops_list)
+            else:
+                aggregated_grads = self.grads
+                aggregation_read_ops = ready_to_communicate
+
+            with tf.control_dependencies([aggregation_read_ops]):
+                avg_grads = self.allreduce(aggregated_grads)
+                just_grads = map(lambda tup: tup[0], avg_grads)
+                vars_list = map(lambda tup: tup[1], self.grads)
+                agg_grads = list(zip(just_grads, vars_list))
+                opt = get_opt_fn()
+                main_fetch = opt.apply_gradients(agg_grads, name='main_fetch')
+
+            # Clear gradients.
+            clear_ops_list = []
+            if self._aggregation_frequency > 1:
+                with tf.control_dependencies([main_fetch]):
+                    for idx, (grad, var) in enumerate(self.gpu_shadow_vars):
+                        with tf.variable_scope("aggregation_variables", reuse=True):
+                            grad_aggregation_variable_name = str(idx)
+                            grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
+                            clear_op = grad_aggregator.assign(grad_aggregator.initial_value)
+                            clear_ops_list.append(clear_op)
+                self.comm_op = tf.group(*clear_ops_list)
+            else:
+                self.comm_op = main_fetch
 
         def broadcast(self):
             logger.info("Running broadcast ...")

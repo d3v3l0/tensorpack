@@ -78,12 +78,12 @@ config = AttrDict()
 _C = config     # short alias to avoid coding
 
 # mode flags ---------------------
-_C.TRAINER = 'replicated'  # options: 'horovod', 'replicated'
+_C.TRAINER = 'horovod'  # options: 'horovod', 'replicated'
 _C.MODE_MASK = True        # FasterRCNN or MaskRCNN
-_C.MODE_FPN = False
+_C.MODE_FPN = True
 
 # dataset -----------------------
-_C.DATA.BASEDIR = '/path/to/your/DATA/DIR'
+_C.DATA.BASEDIR = '/data/COCO/DIR'
 # All TRAIN dataset will be concatenated for training.
 _C.DATA.TRAIN = ('coco_train2014', 'coco_valminusminival2014')   # i.e. trainval35k, AKA train2017
 # Each VAL dataset will be evaluated separately (instead of concatenated)
@@ -99,7 +99,7 @@ _C.DATA.ABSOLUTE_COORD = True
 _C.DATA.NUM_WORKERS = 10
 
 # backbone ----------------------
-_C.BACKBONE.WEIGHTS = ''   # /path/to/weights.npz
+_C.BACKBONE.WEIGHTS = '/data/ImageNet-R50-AlignPadding.npz'   # /path/to/weights.npz
 _C.BACKBONE.RESNET_NUM_BLOCKS = [3, 4, 6, 3]     # for resnet50
 # RESNET_NUM_BLOCKS = [3, 4, 23, 3]    # for resnet101
 _C.BACKBONE.FREEZE_AFFINE = False   # do not train affine parameters inside norm layers
