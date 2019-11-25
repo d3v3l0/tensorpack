@@ -273,21 +273,24 @@ class Trainer(object):
                 # refresh global step (might have changed by callbacks) TODO ugly
                 # what if gs is changed later?
                 self.loop.update_global_step()
+                # Used to track when to perform gradient aggregation.
+                batches_since_gradient_aggregation = 0
                 for self.loop._epoch_num in range(
                         self.loop.starting_epoch, self.loop.max_epoch + 1):
                     logger.info("Start Epoch {} ...".format(self.loop.epoch_num))
                     self._callbacks.before_epoch()
                     start_time = time.time()
-                    self.loop.steps_per_epoch -= self.loop.steps_per_epoch % aggregation_frequency
                     for self.loop._local_step in range(self.loop.steps_per_epoch):
                         # print ("Step: ", self.loop._local_step)
                         if self.hooked_sess.should_stop():
                             return
-
-                        if (self.loop._local_step + 1) % aggregation_frequency == 0:
+                        assert batches_since_gradient_aggregation < aggregation_frequency
+                        if (batches_since_gradient_aggregation + 1) % aggregation_frequency == 0:
                             self.run_step()  # implemented by subclass
+                            batches_since_gradient_aggregation = 0
                         else:
                             self.run_step_train_only()
+                            batches_since_gradient_aggregation += 1
                         self._callbacks.trigger_step()
                     self._callbacks.after_epoch()
                     logger.info("Epoch {} (global_step {}) finished, time:{}.".format(
